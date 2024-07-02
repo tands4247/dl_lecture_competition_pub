@@ -9,7 +9,8 @@ import pandas
 import torch
 import torch.nn as nn
 import torchvision
-from torchvision import transforms
+import torchvision.transforms.v2 as transforms
+from datetime import datetime
 
 
 def set_seed(seed):
@@ -321,7 +322,6 @@ def train(model, dataloader, optimizer, criterion, device):
     for image, question, answers, mode_answer in dataloader:
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
-
         pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
 
@@ -358,31 +358,133 @@ def eval(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
-def main():
-    # deviceの設定
-    set_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+"""earlystoppingクラス"""
+class EarlyStopping:
+    def __init__(self, patience=5, verbose=False):
+        """引数：最小値の非更新数カウンタ、表示設定、モデル格納path"""
 
-    # dataloader / model
-    transform = transforms.Compose([
+        self.patience = patience    #設定ストップカウンタ
+        self.verbose = verbose      #表示の有無
+        self.counter = 0            #現在のカウンタ値
+        self.best_score = None      #ベストスコア
+        self.early_stop = False     #ストップフラグ
+        self.val_loss_min = np.Inf   #前回のベストスコア記憶用
+        # self.path = path             #ベストモデル格納path
+
+    def __call__(self, val_loss, model):
+        """
+        特殊(call)メソッド
+        実際に学習ループ内で最小lossを更新したか否かを計算させる部分
+        """
+        score = -val_loss
+
+        if self.best_score is None:  #1Epoch目の処理
+            self.best_score = score   #1Epoch目はそのままベストスコアとして記録する
+            self.checkpoint(val_loss, model)  #記録後にモデルを保存してスコア表示する
+        elif score < self.best_score:  # ベストスコアを更新できなかった場合
+            self.counter += 1   #ストップカウンタを+1
+            if self.verbose:  #表示を有効にした場合は経過を表示
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')  #現在のカウンタを表示する 
+            if self.counter >= self.patience:  #設定カウントを上回ったらストップフラグをTrueに変更
+                self.early_stop = True
+        else:  #ベストスコアを更新した場合
+            self.best_score = score  #ベストスコアを上書き
+            self.checkpoint(val_loss, model)  #モデルを保存してスコア表示
+            self.counter = 0  #ストップカウンタリセット
+
+    def checkpoint(self, val_loss, model):
+        '''ベストスコア更新時に実行されるチェックポイント関数'''
+        # if self.verbose:  #表示を有効にした場合は、前回のベストスコアからどれだけ更新したか？を表示
+        #     print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+        # torch.save(model.state_dict(), self.path)  #ベストモデルを指定したpathに保存
+        self.val_loss_min = val_loss  #その時のlossを記録する
+
+
+
+class Cutout(object):
+    """Randomly mask out one or more patches from an image.
+
+    Args:
+        n_holes (int): Number of patches to cut out of each image.
+        length (int): The length (in pixels) of each square patch.
+    """
+    def __init__(self, n_holes, length):
+        self.n_holes = n_holes
+        self.length = length
+
+    def __call__(self, img):
+        """
+        Args:
+            img (Tensor): Tensor image of size (C, H, W).
+        Returns:
+            Tensor: Image with n_holes of dimension length x length cut out of it.
+        """
+        h = img.size(1)
+        w = img.size(2)
+
+        mask = np.ones((h, w), np.float32)
+
+        for n in range(self.n_holes):
+            y = np.random.randint(h)
+            x = np.random.randint(w)
+
+            y1 = np.clip(y - self.length // 2, 0, h)
+            y2 = np.clip(y + self.length // 2, 0, h)
+            x1 = np.clip(x - self.length // 2, 0, w)
+            x2 = np.clip(x + self.length // 2, 0, w)
+
+            mask[y1: y2, x1: x2] = 0.
+
+        mask = torch.from_numpy(mask)
+        mask = mask.expand_as(img)
+        img = img * mask
+
+        return img
+
+
+def get_loader():
+    # データ拡張
+    train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.ToImage(), # v2からToTensor推推奨
+        # cutout(40, 1, False)
+        Cutout(n_holes=1, length=16)
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToImage(), # v2からToTensor推推奨
+        Cutout(n_holes=1, length=16)
+    ])
+
+    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=train_transform)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=test_transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
+    return train_dataset, test_dataset, train_loader, test_loader
+
+
+def main():
+    # deviceの設定
+    set_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # データの自作ロード
+    train_dataset, test_dataset, train_loader, test_loader = get_loader()
+
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 100
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # train model
+    print("学習start")
+    earlystopping = EarlyStopping(patience=3, verbose=True) #ストプカウンタ
     for epoch in range(num_epoch):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
         print(f"【{epoch + 1}/{num_epoch}】\n"
@@ -390,10 +492,15 @@ def main():
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
               f"train simple acc: {train_simple_acc:.4f}")
+        earlystopping(train_loss, model) #callメソッド呼び出し
+        if earlystopping.early_stop: #ストップフラグがTrueの場合、breakでforループを抜ける
+            print("Early Stopping!")
+            break
 
     # 提出用ファイルの作成
     model.eval()
     submission = []
+    print("--------test---------")
     for image, question in test_loader:
         image, question = image.to(device), question.to(device)
         pred = model(image, question)
@@ -402,8 +509,11 @@ def main():
 
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
-    torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+    now = datetime.now()
+    now_time = now.strftime("%m-%d-%H:%M:%S")
+    torch.save(model.state_dict(), f"./model/model_{now_time}.pth")
+    np.save(f"./submits/submission_{now_time}.npy", submission)
+    print('保存done')
 
 if __name__ == "__main__":
     main()
