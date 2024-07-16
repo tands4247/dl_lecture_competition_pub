@@ -12,6 +12,7 @@ import torchvision
 import torchvision.transforms.v2 as transforms
 from datetime import datetime
 
+from transformers import ViltProcessor, ViltForQuestionAnswering
 
 def set_seed(seed):
     random.seed(seed)
@@ -69,6 +70,7 @@ class VQADataset(torch.utils.data.Dataset):
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
+        # self.processor = processor  # add
 
         # question / answerの辞書を作成
         self.question2idx = {}
@@ -309,9 +311,30 @@ class VQAModel(nn.Module):
 
         return x
 
+from tqdm.auto import tqdm
+def collate_fn(batch):
+  input_ids = [item['input_ids'] for item in batch]
+  pixel_values = [item['pixel_values'] for item in batch]
+  attention_mask = [item['attention_mask'] for item in batch]
+  token_type_ids = [item['token_type_ids'] for item in batch]
+  labels = [item['labels'] for item in batch]
+
+  # create padded pixel values and corresponding pixel mask
+  encoding = processor.image_processor.pad(pixel_values, return_tensors="pt")
+
+  # create new batch
+  batch = {}
+  batch['input_ids'] = torch.stack(input_ids)
+  batch['attention_mask'] = torch.stack(attention_mask)
+  batch['token_type_ids'] = torch.stack(token_type_ids)
+  batch['pixel_values'] = encoding['pixel_values']
+  batch['pixel_mask'] = encoding['pixel_mask']
+  batch['labels'] = torch.stack(labels)
+
+  return batch
 
 # 4. 学習の実装
-def train(model, dataloader, optimizer, criterion, device):
+def VQA_train(model, dataloader, optimizer, criterion, device):
     model.train()
 
     total_loss = 0
@@ -334,6 +357,56 @@ def train(model, dataloader, optimizer, criterion, device):
         simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
+
+# fine tuning
+def ViLT_train(model, dataloader, optimizer, criterion, device):
+    model.train()
+    
+    total_loss = 0
+    total_acc = 0
+    simple_acc = 0
+
+    start = time.time()
+    for batch in tqdm(dataloader):
+        batch = {k:v.to(device) for k,v in batch.items()}
+        optimizer.zero_grad()
+        output = model(**batch)
+        outputs = model(**batch)
+        loss = outputs.loss
+        print("Loss:", loss.item())
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
+        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+        # if isinstance(batch, dict):
+        #     batch = {k:v.to(device) for k,v in batch.items()}
+        # elif isinstance(batch, list):
+        #     batch = [b.to(device) if isinstance(b, torch.Tensor) else b for b in batch]
+        # elif isinstance(batch, torch.Tensor):
+        #     batch = batch.to(device)
+        # else:
+        #     raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+        # optimizer.zero_grad()
+        # outputs = model(**batch)
+        # loss = outputs.loss
+        # logits = outputs.logits
+
+        # # Assuming 'answers' is part of the batch or can be derived from batch
+        # answers = batch['answers'] if isinstance(batch, dict) else batch[1]  # Adjust as necessary
+        # mode_answer = answers.mode(dim=1)[0]
+
+        # print("Loss:", loss.item())
+        # loss.backward()
+        # optimizer.step()
+
+        # total_loss += loss.item()
+        # total_acc += VQA_criterion(logits.argmax(1), answers)  # VQA accuracy
+        # simple_acc += (logits.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+
+
 
 
 def eval(model, dataloader, optimizer, criterion, device):
@@ -360,7 +433,7 @@ def eval(model, dataloader, optimizer, criterion, device):
 
 """earlystoppingクラス"""
 class EarlyStopping:
-    def __init__(self, patience=5, verbose=False):
+    def __init__(self, patience=3, verbose=False):
         """引数：最小値の非更新数カウンタ、表示設定、モデル格納path"""
 
         self.patience = patience    #設定ストップカウンタ
@@ -447,7 +520,6 @@ def get_loader():
     train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToImage(), # v2からToTensor推推奨
-        # cutout(40, 1, False)
         Cutout(n_holes=1, length=16)
     ])
 
@@ -461,11 +533,12 @@ def get_loader():
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=test_transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    # train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, collate_fn=collate_fn, batch_size=4, shuffle=True)
+    
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     return train_dataset, test_dataset, train_loader, test_loader
-
 
 def main():
     # deviceの設定
@@ -475,18 +548,26 @@ def main():
     # データの自作ロード
     train_dataset, test_dataset, train_loader, test_loader = get_loader()
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    # VQAで事前学習済みモデル作成
+    # model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+
+    # 事前学習済みモデルをViLTでファイチチューニニグ
+    processor = ViltProcessor.from_pretrained("dandelin/vilt-b32-mlm")
+    model = ViltForQuestionAnswering.from_pretrained("dandelin/vilt-b32-mlm").to(device)
+    
 
     # optimizer / criterion
     num_epoch = 100
     criterion = nn.CrossEntropyLoss()
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # train model
     print("学習start")
-    earlystopping = EarlyStopping(patience=3, verbose=True) #ストプカウンタ
+    earlystopping = EarlyStopping(patience=5, verbose=True) #ストプカウンタ
     for epoch in range(num_epoch):
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
+        # train_loss, train_acc, train_simple_acc, train_time = VQA_train(model, train_loader, optimizer, criterion, device)
+        train_loss, train_acc, train_simple_acc, train_time = ViLT_train(model, train_loader, optimizer, criterion, device)
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
