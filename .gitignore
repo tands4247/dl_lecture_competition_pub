@@ -1,0 +1,10 @@
+data/
+notebooks/
+src/
+model/
+submits/
+description.txt
+Dockerfile
+README.md
+requrements.txt
+train.py
